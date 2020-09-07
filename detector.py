@@ -17,7 +17,7 @@ MONITORING_TIME = 60  # Number of seconds over which the number of incomplete
                       # handshakes is computed
 
 # MONITORING_TIME is split in windows of HANDSHAKE_TIMEOUT seconds
-WINDOWS_COUNT = MONITORING_TIME / HANDSHAKE_TIMEOUT
+WINDOWS_COUNT = int(MONITORING_TIME / HANDSHAKE_TIMEOUT)
 
 
 def get_uptime_ms():
@@ -33,7 +33,8 @@ def mitigate_attack(malicious_sources):
 
 parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('interface', help='Network interface to monitor', type=str)
+parser.add_argument('interfaces', help='Network interfaces to monitor',
+                    nargs="+", type=str)
 args = parser.parse_args()
 
 # Load eBPF programs
@@ -44,14 +45,17 @@ pending_handshakes = b.get_table('pending_handshakes')
 
 ip = IPRoute()
 
-ifindex = ip.link_lookup(ifname=args.interface)[0]
+ifindexes = []
+for iface in args.interfaces:
+    ifindexes.append(ip.link_lookup(ifname=iface)[0])
 
-# Create TC qdisc and attach programs
-ip.tc('add', 'clsact', ifindex)
-ip.tc('add-filter', 'bpf', ifindex, ':1', fd=ingress_fn.fd,
-      name=ingress_fn.name, parent='ffff:fff2', classid=1, direct_action=True)
-ip.tc('add-filter', 'bpf', ifindex, ':1', fd=egress_fn.fd, name=egress_fn.name,
-      parent='ffff:fff3', classid=1, direct_action=True)
+    # Create TC qdisc and attach programs
+    ip.tc('add', 'clsact', ifindexes[-1])
+    ip.tc('add-filter', 'bpf', ifindexes[-1], ':1', fd=ingress_fn.fd,
+        name=ingress_fn.name, parent='ffff:fff2', classid=1, direct_action=True)
+    ip.tc('add-filter', 'bpf', ifindexes[-1], ':1', fd=egress_fn.fd,
+          name=egress_fn.name, parent='ffff:fff3', classid=1,
+          direct_action=True)
 
 incomplete_handshakes = {}  # Count of incomplete handshakes for every src
                             # address over the whole MONITORING_TIME
@@ -109,5 +113,6 @@ while 1:
     except KeyboardInterrupt:
       break
 
-print('Removing filters from device')
-ip.tc('del', 'clsact', ifindex)
+print('Removing filters from devices')
+for ifindex in ifindexes:
+    ip.tc('del', 'clsact', ifindex)
