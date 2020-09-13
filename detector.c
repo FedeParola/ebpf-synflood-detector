@@ -13,8 +13,8 @@ struct handshake_status {
   bool synack_sent;
 } __attribute__((packed));
 
-BPF_TABLE("lru_hash", struct tcp_session_key, struct handshake_status,
-          pending_handshakes, 1024);
+BPF_HASH(pending_handshakes, struct tcp_session_key, struct handshake_status,
+         10000);
 
 int monitor_ingress(struct __sk_buff *skb) {
   void *data = (void *)(long)skb->data;
