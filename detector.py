@@ -3,6 +3,7 @@
 import argparse
 import atexit
 import json
+import logging
 import requests
 import socket
 import subprocess
@@ -31,11 +32,11 @@ HANDSHAKE_PURGE_TIME = 60  # An handshake that didn't receive a SYN_ACK is
 
 
 def cleanup():
-    print('Removing filters from devices')
+    LOGGER.info('Removing filters from devices')
     for ifindex in ifindexes:
         if args.action == 'mitigate':
             subprocess.run(['polycubectl', 'ddosmitigator', 'del',
-                            'dm' + str(ifindexes[-1])],
+                            'dm' + str(ifindex)],
                            stdout=subprocess.DEVNULL)
 
         ip.tc('del', 'clsact', ifindex)
@@ -56,13 +57,12 @@ def mitigate_attack(malicious_sources):
                           str(ifindex) + '/blacklist-src',
                           data=json.dumps(payload))
         if r.status_code == 201:
-            print('Addresses blacklisted on interface ' + args.interfaces[i])
+            LOGGER.info('Addresses blacklisted on interface %s', 
+                        args.interfaces[i])
         else:
-            print('Error adding addresses to blacklist on interface ' +
-                  args.interfaces[i] + ': ' + r.text)
+            LOGGER.error('Error adding addresses to blacklist on interface ' +
+                         '%s: %s', args.interfaces[i], r.text)
 
-
-atexit.register(cleanup)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('interfaces', help='Network interfaces to monitor',
@@ -72,12 +72,29 @@ parser.add_argument('-a --action', help='Action to perform on malicious ' +
                     'Mitigator; print: print addresses; none', dest='action',
                     choices=['mitigate', 'print', 'none'], default='none',
                     type=str)
+parser.add_argument('-l --logfile', help='File to print log to', dest='logfile',
+                    type=str)
 args = parser.parse_args()
+
+# Configure logger
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+formatter = logging.Formatter('[%(levelname)s] [%(created)f] %(message)s')
+ch.setFormatter(formatter)
+LOGGER.addHandler(ch)
+if args.logfile:
+    fh = logging.FileHandler(args.logfile)
+    fh.setFormatter(formatter)
+    LOGGER.addHandler(fh)
+
+atexit.register(cleanup)
 
 if args.action == 'mitigate':
     # Check polycube is running
     if subprocess.run('polycubectl', stdout=subprocess.DEVNULL).returncode != 0:
-        print('Polycube not running')
+        LOGGER.error('Polycube not running')
         exit(1)
 
 # Load eBPF programs
@@ -96,7 +113,7 @@ for iface in args.interfaces:
         # Add DDoS Mitigator cube to interface in XDP_DRV mode
         cube_name = 'dm' + str(ifindexes[-1])
         subprocess.run(['polycubectl', 'ddosmitigator', 'add', cube_name,
-                        'type=xdp_skb'],
+                        'type=xdp_drv'],
                        stdout=subprocess.DEVNULL, check=True)
         subprocess.run(['polycubectl', 'attach', cube_name, iface],
                        stdout=subprocess.DEVNULL, check=True)
@@ -117,9 +134,12 @@ incomplete_handshakes = {}  # Count of incomplete handshakes for every src
 monitoring_windows = [{}] * WINDOWS_COUNT
 current_window = 0
 
+global_malicious_source = set()  # Potentially malicius sources found during all
+                                 # the execution of the detector
+
 sleep_until = time.time()
 
-print('Monitoring interfaces, hit CTRL+C to stop')
+LOGGER.info('Monitoring interfaces, hit CTRL+C to stop')
 while 1:
     try:
         sleep_until += HANDSHAKE_TIMEOUT
@@ -129,7 +149,7 @@ while 1:
             # If sleep time is negative don't sleep
             pass
 
-        print('Checking handshakes')
+        LOGGER.info('Checking handshakes')
 
         # Remove handshakes of the oldest window
         for saddr, handshakes in monitoring_windows[current_window].items():
@@ -169,17 +189,22 @@ while 1:
         for saddr in active_sources:
             if (incomplete_handshakes[saddr] > HANDSHAKES_THRESHOLD):
                 malicious_sources.append(saddr)
+                global_malicious_source.add(saddr)
 
         if len(malicious_sources) > 0:
-            print('Detected ' + str(len(malicious_sources)) +
-                  ' potentially malicious source addresses')
+            LOGGER.info('Detected %d new potentially malicious source ' +
+                        'addresses. Total %d', len(malicious_sources),
+                        len(global_malicious_source))
 
             if args.action == 'mitigate':
                 mitigate_attack(malicious_sources)
             elif args.action == 'print':
                 for saddr in malicious_sources:
                     print(socket.inet_ntoa(saddr.to_bytes(4, 'little')))
-            
+
+        else:
+            LOGGER.info('No new potentially malicious source addresses ' +
+                        'detected. Total %d', len(global_malicious_source))
 
         current_window = (current_window + 1) % WINDOWS_COUNT
 

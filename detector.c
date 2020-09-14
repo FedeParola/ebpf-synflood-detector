@@ -19,7 +19,7 @@ BPF_HASH(pending_handshakes, struct tcp_session_key, struct handshake_status,
 int monitor_ingress(struct __sk_buff *skb) {
   void *data = (void *)(long)skb->data;
   void *data_end = (void *)(long)skb->data_end;
-	
+
   struct ethhdr *eth = data;
   if ((void *)(eth + 1) > data_end) {
     return TC_ACT_SHOT;
