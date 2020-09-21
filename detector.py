@@ -2,6 +2,8 @@
 
 import argparse
 import atexit
+import ctypes as ct
+import errno
 import json
 import logging
 import requests
@@ -10,7 +12,7 @@ import subprocess
 import threading
 import time
 
-from bcc import BPF
+from bcc import BPF, lib
 from pyroute2 import IPRoute
 
 
@@ -21,7 +23,7 @@ HANDSHAKE_TIMEOUT = 10  # An handshake with a SYN_ACK is considered incomplete
 HANDSHAKES_THRESHOLD = 5  # Number of incomplete handshakes after which a
                           # source is considered malicious
 
-MONITORING_TIME = 60  # Number of seconds over which the number of incomplete
+MONITORING_TIME = 60  # Number of seconds over which the number of incomplete 
                       # handshakes is computed
 
 # MONITORING_TIME is split in windows of HANDSHAKE_TIMEOUT seconds
@@ -29,6 +31,8 @@ WINDOWS_COUNT = int(MONITORING_TIME / HANDSHAKE_TIMEOUT)
 
 HANDSHAKE_PURGE_TIME = 60  # An handshake that didn't receive a SYN_ACK is
                            # removed from the map after this time
+
+BATCH_SIZE = 10000  # Size of the batch to read from handshakes map
 
 
 def cleanup():
@@ -156,35 +160,72 @@ while 1:
                                 # handshakes in the current window
 
         # Look for incomplete handshakes
-        for session, handshake in pending_handshakes.items():
-            if handshake.synack_sent:
-                if (BPF.monotonic_time() - handshake.begin_time >=
-                    HANDSHAKE_TIMEOUT * 1000):
-                    active_sources.add(session.saddr)
+        batch = ct.c_ulonglong(0)
+        count = ct.c_int(BATCH_SIZE)
+        keys = (pending_handshakes.Key * BATCH_SIZE)()
+        values = (pending_handshakes.Leaf * BATCH_SIZE)()
+        del_keys = (pending_handshakes.Key * BATCH_SIZE)()
 
-                    # Add handshake to the current window
-                    if session.saddr in monitoring_windows[current_window]:
-                        monitoring_windows[current_window][session.saddr] += 1
+        ret = lib.bpf_map_lookup_batch(pending_handshakes.get_fd(), None,
+                                       ct.byref(batch), keys, values,
+                                       ct.byref(count), None)
+        while not ret:
+            del_keys_count = 0
+            uptime = BPF.monotonic_time()
+            for i in range(count.value):
+                session = keys[i]
+                handshake = values[i]
+
+                if handshake.synack_sent:
+                    if (uptime - handshake.begin_time >=
+                        HANDSHAKE_TIMEOUT * 1000000000):
+                        active_sources.add(session.saddr)
+
+                        # Add handshake to the current window
+                        if session.saddr in monitoring_windows[current_window]:
+                            monitoring_windows[current_window][session.saddr] += 1
+                        else:
+                            monitoring_windows[current_window][session.saddr] = 1
+
+                        # Add handshake to the global counter
+                        if session.saddr in incomplete_handshakes:
+                            incomplete_handshakes[session.saddr] += 1
+                        else:
+                            incomplete_handshakes[session.saddr] = 1
+
+                        del_keys[del_keys_count] = session
+                        del_keys_count += 1
+
+                elif (uptime - handshake.begin_time >=
+                      HANDSHAKE_PURGE_TIME * 1000000000):
+                    del_keys[del_keys_count] = session
+                    del_keys_count += 1
+
+            # Batch delete expired handshakes
+            count = ct.c_int(del_keys_count)
+            deleted = 0
+            while deleted < del_keys_count:
+                ret = lib.bpf_map_delete_batch(pending_handshakes.get_fd(),
+                                               ct.pointer(del_keys[deleted]),
+                                               ct.byref(count), None)
+                if ret:
+                    if ct.get_errno() == errno.ENOENT:
+                        break
                     else:
-                        monitoring_windows[current_window][session.saddr] = 1
+                        LOGGER.warning('Error deleting handshakes: %d',
+                                       ct.get_errno())
+                deleted += count.value
+                count.value = del_keys_count - deleted
+            
+            # Lookup next batch
+            count.value = BATCH_SIZE
+            ret = lib.bpf_map_lookup_batch(pending_handshakes.get_fd(),
+                                           ct.byref(batch), ct.byref(batch),
+                                           keys, values, ct.byref(count), None)
 
-                    # Add handshake to the global counter
-                    if session.saddr in incomplete_handshakes:
-                        incomplete_handshakes[session.saddr] += 1
-                    else:
-                        incomplete_handshakes[session.saddr] = 1
-
-                    try:
-                        del pending_handshakes[session]
-                    except KeyError:
-                        pass
-
-            elif (BPF.monotonic_time() - handshake.begin_time >=
-                  HANDSHAKE_PURGE_TIME * 1000):
-                try:
-                    del pending_handshakes[session]
-                except KeyError:
-                    pass
+        if ct.get_errno() != errno.ENOENT:
+            LOGGER.error('Error scanning handshakes map: %d', ct.get_errno())
+            exit(1)
 
         # Look for potentially malicious sources
         malicious_sources = []
@@ -199,7 +240,9 @@ while 1:
                         len(global_malicious_source))
 
             if args.action == 'mitigate':
-                mitigate_attack(malicious_sources)
+                mitigate_t = threading.Thread(target=mitigate_attack,
+                                              args=[malicious_sources])
+                mitigate_t.start()
             elif args.action == 'print':
                 for saddr in malicious_sources:
                     print(socket.inet_ntoa(saddr.to_bytes(4, 'little')))
