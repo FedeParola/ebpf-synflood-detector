@@ -14,7 +14,7 @@ struct handshake_status {
 } __attribute__((packed));
 
 BPF_HASH(pending_handshakes, struct tcp_session_key, struct handshake_status,
-         100000);
+         HANDSHAKES_MAP_SIZE);
 
 int monitor_ingress(struct __sk_buff *skb) {
   void *data = (void *)(long)skb->data;
