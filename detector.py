@@ -21,7 +21,7 @@ HANDSHAKE_TIMEOUT = 10  # An handshake with a SYN_ACK is considered incomplete
 HANDSHAKES_THRESHOLD = 5  # Number of incomplete handshakes after which a
                           # source is considered malicious
 
-MONITORING_TIME = 60  # Number of seconds over which the number of incomplete 
+MONITORING_TIME = 60  # Number of seconds over which the number of incomplete
                       # handshakes is computed
 
 # MONITORING_TIME is split in windows of HANDSHAKE_TIMEOUT seconds
@@ -40,10 +40,6 @@ def cleanup():
                            stdout=subprocess.DEVNULL)
 
         ip.tc('del', 'clsact', ifindex)
-
-def get_uptime_ms():
-    with open('/proc/uptime', 'r') as f:
-        return float(f.readline().split()[0]) * 1000
 
 def mitigate_attack(malicious_sources):
     """
@@ -162,7 +158,7 @@ while 1:
         # Look for incomplete handshakes
         for session, handshake in pending_handshakes.items():
             if handshake.synack_sent:
-                if (get_uptime_ms() - handshake.begin_time/1000000 >=
+                if (BPF.monotonic_time() - handshake.begin_time >=
                     HANDSHAKE_TIMEOUT * 1000):
                     active_sources.add(session.saddr)
 
@@ -178,11 +174,17 @@ while 1:
                     else:
                         incomplete_handshakes[session.saddr] = 1
 
-                    del pending_handshakes[session]
+                    try:
+                        del pending_handshakes[session]
+                    except KeyError:
+                        pass
 
-            elif (get_uptime_ms() - handshake.begin_time/1000000 >=
+            elif (BPF.monotonic_time() - handshake.begin_time >=
                   HANDSHAKE_PURGE_TIME * 1000):
-                del pending_handshakes[session]
+                try:
+                    del pending_handshakes[session]
+                except KeyError:
+                    pass
 
         # Look for potentially malicious sources
         malicious_sources = []
