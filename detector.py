@@ -138,7 +138,7 @@ sleep_until = time.time()
 LOGGER.info('Monitoring interfaces, hit CTRL+C to stop')
 while 1:
     try:
-        sleep_until += HANDSHAKE_TIMEOUT
+        sleep_until += HANDSHAKE_TIMEOUT + 1
         try:
             time.sleep(sleep_until - time.time())
         except ValueError:
